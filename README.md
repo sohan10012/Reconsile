@@ -510,12 +510,6 @@ Displays registered corporate vendors and their terms.
 
 ---
 
-## License
-
-This project is licensed under the MIT License. See the [MIT License Details](https://opensource.org/licenses/MIT) page for terms.
-
----
-
 ## Contributing
 
 We welcome contributions to Reconcile. To contribute:
