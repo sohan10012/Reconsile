@@ -1,0 +1,756 @@
+================================================================================
+RECONCILE — PROJECT DOCUMENTATION
+================================================================================
+Audience : New developers joining the project
+Accuracy : Documents ONLY what is implemented in the current codebase.
+           Placeholders and simulated modules are explicitly flagged.
+Stack    : Next.js 16 (App Router) / React 19 / TypeScript / Neon Postgres /
+           Drizzle ORM / Better Auth / Vercel Blob / Vercel AI Gateway
+================================================================================
+--------------------------------------------------------------------------------
+1. PROJECT OVERVIEW
+--------------------------------------------------------------------------------
+Project name
+  Reconcile
+Purpose
+  Reconcile is an AI-powered, deterministic-first invoice verification
+  platform for Procure-to-Pay (P2P) workflows. It ingests scanned invoice
+  documents (images/PDFs), extracts structured data with a vision LLM, and
+  then — critically — makes every financial decision OUTSIDE the model using
+  deterministic code: strict schema validation, fuzzy matching, cross-encoder
+  re-ranking, PO alignment, and a weighted rule engine. Every step is written
+  to an immutable audit log.
+Business problem it solves
+  Accounts-payable teams manually compare invoices against purchase orders to
+  catch overbilling, duplicates, wrong currencies, price creep, and quantity
+  inflation. Pure-LLM automation is unsafe because models hallucinate values.
+  Reconcile's "zero-hallucination" methodology uses the LLM only for
+  perception (reading the document); all verification, matching, scoring, and
+  the approve/review/reject decision are produced by explicit, auditable,
+  deterministic rules.
+End-to-end workflow
+  1. User signs up / signs in (email + password, Better Auth).
+  2. User creates vendors and purchase orders (with line items) as master data.
+  3. User uploads an invoice image/PDF. The file is stored in a PRIVATE
+     Vercel Blob store under a per-user prefix.
+  4. The pipeline runs server-side:
+     upload -> OCR + LLM extraction -> strict schema validation ->
+     vendor/PO fuzzy matching + cross-encoder re-rank -> line-item alignment
+     -> duplicate detection -> deterministic rule engine -> decision.
+  5. Every step logs a timestamped audit entry with duration and payload.
+  6. The invoice viewer shows OCR text, extracted JSON, matching evidence,
+     rule check results (schema + business, grouped), and a side-by-side
+     invoice-vs-PO comparison.
+  7. Dashboard and analytics aggregate decisions, confidence, exceptions,
+     spend, and "zero-hallucination" health metrics.
+High-level architecture
+  - Single Next.js 16 App Router application (no separate backend service).
+  - React Server Components fetch data; Server Actions perform mutations.
+  - Two REST route handlers exist only for binary file transfer (upload and
+    private file streaming) plus the Better Auth catch-all route.
+  - Neon Postgres accessed via Drizzle ORM (node-postgres Pool driver).
+  - There is NO Row Level Security; EVERY app-table query filters by the
+    session user's id (`userId` column). This is a hard security invariant.
+  - Files live in a private Vercel Blob store; bytes are streamed server-side
+    to the LLM (never exposed by public URL).
+  - AI calls go through the Vercel AI Gateway using the AI SDK (`ai` package)
+    with model string "openai/gpt-4o".
+--------------------------------------------------------------------------------
+2. FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+Fully implemented features
+  1. Email/password authentication (Better Auth)
+     - Sign-up, sign-in, sign-out, session cookies. Auth pages at /sign-in
+       and /sign-up share one AuthForm component. The (app) layout redirects
+       unauthenticated users to /sign-in.
+  2. Vendor management
+     - Create/list/delete vendors (name, tax id, email, phone, address,
+       payment terms). Used by matching to resolve extracted vendor names.
+  3. Purchase order management
+     - Create/list/delete POs with header fields (poNumber, vendor, status,
+       currency, subtotal/tax/total) and multiple line items (description,
+       SKU, quantity, unit price, line total). PO detail page shows items.
+  4. Invoice upload + private storage
+     - Client uploads via POST /api/blob/upload (multipart). Server validates
+       type (image/* or application/pdf) and size (<= 10 MB), stores in the
+       private Blob store at "invoices/{userId}/{timestamp}-{name}", records
+       both the blob URL and pathname in the invoices row.
+  5. Full verification pipeline (see section 10 for stage detail)
+     - Real OCR + structured extraction via vision LLM (two-pass).
+     - Strict schema validation gate (deterministic, pre-trust).
+     - Vendor fuzzy match, PO fuzzy match with exact-first strategy,
+       cross-encoder-style re-ranking, greedy line-item alignment.
+     - Duplicate invoice-number detection per user.
+     - Weighted rule engine producing approve/review/reject + 0–1 score.
+     - Per-step audit logging with durations and JSON payloads.
+     - Graceful failure: on any error the invoice is marked status=failed
+       with errorMessage; the pipeline never hangs.
+  6. Invoice viewer
+     - Live pipeline stepper during processing (7 steps).
+     - Tabs: OCR text, extracted JSON, matching evidence (vendor/PO
+       candidates and scores), rule checks (grouped: "Strict schema
+       validation" vs "Deterministic business rules"), side-by-side
+       invoice-vs-PO line comparison. "Open original" streams the private
+       file through /api/blob/file.
+  7. Dashboard
+     - KPI cards (total invoices, approved, needs review, rejected).
+     - "Zero-hallucination metrics" strip: verification success rate,
+       average confidence, hallucinations prevented (count of failed
+       deterministic checks), average processing time (sum of step durations
+       per invoice), manual review rate.
+     - Auto-processed value, PO value, vendor/PO counts, recent invoices.
+  8. Analytics page
+     - Decision breakdown, top exception reasons (aggregated failed/warned
+       checks across validation reports), spend by vendor, average
+       confidence, straight-through rate, open PO count. Rendered with
+       progress-bar style visualizations (no charting library is used).
+  9. Audit log page
+     - Last 200 audit entries across all invoices: step, status, message,
+       duration, timestamp, invoice id.
+  10. Settings page
+      - Read-only display of account info and the pipeline configuration
+        (tolerances and decision thresholds) plus sign-out.
+  11. UX resilience
+      - app/(app)/loading.tsx skeleton, app/not-found.tsx branded 404,
+        app/error.tsx error boundary with "Try again", dark-only theme,
+        sonner toasts (forced dark), responsive layout.
+Placeholder / simulated implementations (IMPORTANT)
+  A. Cross-encoder re-ranker (lib/matching/reranker.ts)
+     - SIMULATED. A deterministic surrogate blends string-similarity scores
+       to mimic cross-encoder sharpening. The interface is swappable for a
+       real hosted cross-encoder (e.g. sentence-transformers CrossEncoder).
+  B. OCR
+     - There is no dedicated OCR engine (no Tesseract etc.). "OCR" is a
+       vision-LLM transcription pass. It is real AI, but if you need
+       classical OCR guarantees, that engine must be added.
+  C. Settings page
+     - Displays configuration; tolerances are NOT editable in the UI. They
+       are code defaults in lib/rules (2% total, 5% unit price).
+  D. Invoice status transitions "extracted"/"matched" exist in the status
+     enum comment but the pipeline moves uploaded -> processing ->
+     validated | failed directly.
+--------------------------------------------------------------------------------
+3. TECHNOLOGY STACK
+--------------------------------------------------------------------------------
+Frontend
+  - Next.js 16.2.x (App Router, React Server Components, Server Actions)
+  - React 19, TypeScript 5.7
+  - Tailwind CSS v4 (via @tailwindcss/postcss; theme tokens in globals.css)
+  - shadcn/ui-style components (components/ui/*) built on @base-ui/react
+  - lucide-react (icons), sonner (toasts), tw-animate-css, next-themes
+    (installed; only consumed indirectly by the sonner wrapper)
+  - class-variance-authority, clsx, tailwind-merge (styling utilities)
+Backend (same Next.js app)
+  - Server Actions in app/actions/* for all CRUD + pipeline trigger
+  - Route Handlers: /api/blob/upload, /api/blob/file, /api/auth/[...all]
+Database
+  - Neon (serverless Postgres)
+  - Drizzle ORM 0.45.x with node-postgres (pg Pool) driver
+  - Schema managed by running SQL against Neon (no migration files/tooling
+    committed; the schema source of truth for the app is lib/db/schema.ts)
+Authentication
+  - Better Auth 1.6.x with Drizzle adapter, email/password only
+  - Session read server-side via auth.api.getSession({ headers })
+AI / ML
+  - AI SDK ("ai" package v7) via Vercel AI Gateway
+  - Model: "openai/gpt-4o" (vision + file input)
+  - zod v4 for the structured-output schema (Output.object)
+OCR
+  - Vision-LLM transcription pass (no classical OCR engine) — see 2.B
+File storage
+  - @vercel/blob 2.x — PRIVATE access store; server-side put()/get()
+State management
+  - None beyond React state; data flows from RSC page loaders and Server
+    Actions with router.refresh(). No SWR/Redux/Zustand is currently used.
+Build / dev tools
+  - pnpm (pnpm-lock.yaml), ESLint (`pnpm lint`), tsc --noEmit for typecheck
+  - PostCSS + Tailwind v4 pipeline
+Deployment
+  - Vercel (connected Git repo: sohan10012/Reconcile)
+  - @vercel/analytics wired in the root layout
+Not used (explicitly, to avoid confusion)
+  - No Prisma (Drizzle is the ORM). No Docker. No Python services.
+  - No Redis/Upstash. No charting library. No SWR yet.
+--------------------------------------------------------------------------------
+4. PROJECT ARCHITECTURE (LAYER BY LAYER)
+--------------------------------------------------------------------------------
+Presentation layer
+  - app/(app)/* pages are React Server Components: they authenticate, load
+    data via server actions/queries, and render client view components.
+  - Client components (components/**) own interactivity: forms, dialogs,
+    tabs, upload flow, pipeline stepper polling.
+API layer
+  - Server Actions (app/actions/*.ts, "use server") are the primary API:
+    createVendor, createPurchaseOrder, createInvoice, processInvoice, etc.
+    Every action resolves the session user first (lib/session.ts getUserId)
+    and scopes all SQL by userId.
+  - Route Handlers exist only where Server Actions are unsuitable (binary
+    upload/streaming) and for the Better Auth handler.
+Business logic layer
+  - lib/pipeline/index.ts — the orchestrator; runs the 7 stages, persists
+    results, writes audit logs, handles failure.
+  - lib/matching/* — pure, deterministic matching functions (no I/O).
+  - lib/rules/index.ts — pure rule engine: checks -> weighted score ->
+    decision. No I/O.
+  - lib/validation/schema.ts — pure strict schema gate. No I/O.
+AI services layer
+  - lib/ai/extraction.ts — the ONLY file that talks to the LLM. Exposes
+    extractInvoice(bytes) and hides model/provider details behind a
+    swappable interface.
+Validation engine
+  - Two deterministic gates: (1) schema gate on raw LLM output;
+    (2) business-rule engine on matched data. Both emit RuleCheck entries
+    that are persisted in validation_reports and rendered in the UI.
+Database layer
+  - lib/db/index.ts (Drizzle client on pg Pool, DATABASE_URL) and
+    lib/db/schema.ts (all table definitions). App tables intentionally have
+    no FK constraints (cheap iteration); auth tables do have FKs.
+Security model (critical invariant)
+  - Per-query userId scoping everywhere (no RLS). Private blob store; file
+    bytes only ever served through the authenticated /api/blob/file route,
+    which verifies the pathname's user prefix before streaming.
+--------------------------------------------------------------------------------
+5. FOLDER STRUCTURE
+--------------------------------------------------------------------------------
+reconcile/
+├── app/
+│   ├── (app)/                      # Authenticated app shell (route group)
+│   │   ├── analytics/page.tsx
+│   │   ├── audit-log/page.tsx
+│   │   ├── dashboard/page.tsx
+│   │   ├── invoices/
+│   │   │   ├── [id]/page.tsx       # Invoice viewer
+│   │   │   └── page.tsx            # Invoice list + upload
+│   │   ├── purchase-orders/
+│   │   │   ├── [id]/page.tsx       # PO detail
+│   │   │   └── page.tsx            # PO list + create
+│   │   ├── vendors/page.tsx
+│   │   ├── settings/page.tsx
+│   │   ├── layout.tsx              # Auth guard + sidebar shell
+│   │   └── loading.tsx             # Route-group skeleton
+│   ├── actions/                    # Server Actions ("use server")
+│   │   ├── dashboard.ts
+│   │   ├── invoices.ts
+│   │   ├── purchase-orders.ts
+│   │   └── vendors.ts
+│   ├── api/
+│   │   ├── auth/[...all]/route.ts  # Better Auth handler
+│   │   └── blob/
+│   │       ├── file/route.ts       # Private file streaming (GET)
+│   │       └── upload/route.ts     # Multipart upload (POST)
+│   ├── sign-in/page.tsx
+│   ├── sign-up/page.tsx
+│   ├── error.tsx                   # Error boundary
+│   ├── globals.css                 # Tailwind v4 theme tokens
+│   ├── layout.tsx                  # Root layout (fonts, Toaster, dark)
+│   ├── not-found.tsx               # 404
+│   └── page.tsx                    # Root: redirects by session
+├── components/
+│   ├── analytics/analytics-view.tsx
+│   ├── audit/audit-log-view.tsx
+│   ├── invoices/
+│   │   ├── invoice-detail.tsx
+│   │   ├── invoices-view.tsx
+│   │   ├── pipeline-stepper.tsx
+│   │   └── rule-checks.tsx
+│   ├── purchase-orders/purchase-orders-view.tsx
+│   ├── vendors/vendors-view.tsx
+│   ├── ui/                         # shadcn-style primitives
+│   │   └── (avatar, badge, button, card, dialog, dropdown-menu, input,
+│   │        label, progress, select, separator, skeleton, sonner, table,
+│   │        tabs, textarea)
+│   ├── app-sidebar.tsx
+│   ├── auth-form.tsx
+│   ├── logo.tsx
+│   ├── page-header.tsx
+│   └── status-badge.tsx
+├── lib/
+│   ├── ai/extraction.ts            # LLM OCR + structured extraction
+│   ├── db/
+│   │   ├── index.ts                # Drizzle client
+│   │   └── schema.ts               # All tables
+│   ├── matching/
+│   │   ├── index.ts                # Fuzzy matching (vendor/PO/lines)
+│   │   └── reranker.ts             # Cross-encoder surrogate (SIMULATED)
+│   ├── pipeline/index.ts           # Orchestrator + audit logger
+│   ├── rules/index.ts              # Deterministic rule engine
+│   ├── validation/schema.ts        # Strict schema gate
+│   ├─��� auth.ts                     # Better Auth server config
+│   ├── auth-client.ts              # Better Auth React client
+│   ├── session.ts                  # getUserId()/getSession() helpers
+│   ├── format.ts                   # Currency/percent/date formatters
+│   ├── types.ts                    # Shared domain types
+│   └── utils.ts                    # cn() class merge
+├── public/samples/                 # Sample invoice image
+├── package.json / pnpm-lock.yaml / tsconfig.json / postcss.config.mjs
+└── PROJECT_DOCUMENTATION.txt       # This file
+--------------------------------------------------------------------------------
+6. FOLDER EXPLANATION
+--------------------------------------------------------------------------------
+app/            Next.js App Router root. Everything routable lives here.
+app/(app)/      Route group wrapping all authenticated pages with a shared
+                layout (session check + sidebar). The parentheses keep the
+                group out of the URL.
+app/actions/    Server Actions — the app's mutation/query API. Each file
+                groups actions by domain (vendors, POs, invoices, dashboard).
+app/api/        The only REST endpoints: auth catch-all, blob upload, and
+                private blob streaming.
+components/     All React components. Domain folders (invoices/, vendors/,
+                purchase-orders/, analytics/, audit/) hold client "view"
+                components; top-level files are shared chrome (sidebar,
+                header, logo, badges, auth form).
+components/ui/  shadcn-style primitive components. Generic, unstyled-domain
+                building blocks only — no business logic.
+lib/            All non-React logic. Pure modules (matching, rules,
+                validation) have no I/O and are unit-testable in isolation;
+                pipeline and ai perform I/O.
+lib/db/         Database client and the Drizzle schema (source of truth for
+                table shapes used by the app).
+public/         Static assets; includes a sample invoice for manual testing.
+--------------------------------------------------------------------------------
+7. FILE DOCUMENTATION (IMPORTANT FILES)
+--------------------------------------------------------------------------------
+--- lib/pipeline/index.ts ---
+Purpose        Pipeline orchestrator. The single entry point is
+               processInvoice(invoiceId) (called from a server action).
+Responsibilities
+               - Loads the invoice row (scoped by userId).
+               - Creates an audit logger that inserts a row into audit_logs
+                 for every step (started/success/failed + duration + data).
+               - Runs stages in order: read private blob bytes
+                 (readInvoiceBytes via get() with access:"private", falling
+                 back to fetch(fileUrl) for legacy rows) -> extractInvoice ->
+                 persist OCR/extraction -> validateInvoiceSchema ->
+                 matchVendor/matchPurchaseOrder (+ crossEncoderRerank over PO
+                 candidates) -> matchLineItems + persist invoice_items ->
+                 duplicate detection -> runRules (with schemaChecks folded
+                 in) -> persist validation_reports + decision on the invoice.
+               - On any thrown error: marks invoice status=failed with
+                 errorMessage and logs a failed audit entry.
+Interacts with lib/ai/extraction, lib/validation/schema, lib/matching/*,
+               lib/rules, lib/db, @vercel/blob.
+--- lib/ai/extraction.ts ---
+Purpose        The only LLM-facing module.
+Key exports    extractInvoice({ data, fileType, fileName }) ->
+               { ocrText, extracted }
+Details        Two generateText calls to "openai/gpt-4o" via AI Gateway:
+               (1) plain-text transcription of the document ("OCR"),
+               (2) structured extraction with Output.object({ schema }) and
+               a zod schema (invoiceNumber, vendorName, invoiceDate,
+               poNumber, currency, subtotal, tax, totalAmount, lineItems[]).
+               Passes raw bytes as a file part (mediaType image/* or
+               application/pdf) because the blob store is private.
+               System prompt forbids inventing values (nulls required).
+--- lib/validation/schema.ts ---
+Purpose        Strict schema gate — first deterministic checkpoint on raw
+               LLM output, before any value is trusted.
+Key exports    validateInvoiceSchema(invoice) -> { valid, checks, issues }
+Checks         schema_invoice_number (critical), schema_vendor_name
+               (critical), schema_total_type (critical, > 0),
+               schema_subtotal_type (warning, nullable >= 0),
+               schema_tax_type (warning, nullable >= 0),
+               schema_invoice_date (warning, Date.parse),
+               schema_currency (warning, /^[A-Za-z]{3}$/ when present),
+               schema_line_items (critical if items exist and any are
+               malformed; warning when zero items). All checks carry
+               category:"schema". valid=false iff any critical check fails.
+--- lib/matching/index.ts ---
+Purpose        Pure deterministic fuzzy-matching toolkit.
+Key exports    normalize, levenshtein, levenshteinSimilarity,
+               tokenSetSimilarity, stringSimilarity (0.6*lev + 0.4*token),
+               matchVendor (threshold 0.55, top-5 candidates),
+               normalizePoNumber, matchPurchaseOrder (exact-first on
+               normalized PO number = confidence 1.0; else weighted blend
+               0.6 poNumber + 0.25 vendor + 0.15 amount proximity, or
+               0.6 vendor + 0.4 amount when no PO number; threshold 0.6),
+               matchLineItems (greedy assignment; SKU exact match beats
+               description similarity; accept >= 0.5).
+--- lib/matching/reranker.ts ---
+Purpose        Cross-encoder re-ranking stage. *** SIMULATED PLACEHOLDER ***
+Details        crossEncoderRerank(query, candidates) deterministically blends
+               joint similarity, token overlap, and base score
+               (final = 0.35*base + 0.65*cross). Interface is designed to be
+               swapped for a real hosted cross-encoder model.
+--- lib/rules/index.ts ---
+Purpose        Deterministic business-rule engine (see section 11).
+Key exports    runRules(ctx) -> ValidationResult, finalize(checks).
+Decision       critical failure -> reject; any warning failure OR score
+               < 0.95 -> review; else approve. Score = weighted pass ratio.
+--- lib/db/schema.ts ---
+Purpose        All Drizzle table definitions (see section 8).
+--- lib/db/index.ts ---
+Purpose        Drizzle client: new Pool({ connectionString:
+               process.env.DATABASE_URL }) wrapped by drizzle().
+--- lib/auth.ts / lib/auth-client.ts / lib/session.ts ---
+Purpose        Better Auth server config (drizzleAdapter, emailAndPassword
+               enabled); React client (signIn/signUp/signOut/useSession);
+               server helpers getSession()/getUserId() (getUserId throws if
+               unauthenticated — every server action calls it first).
+--- lib/types.ts ---
+Purpose        Shared domain types: PipelineStep (upload|ocr|extraction|
+               schema|matching|rules|decision), StepStatus, Decision,
+               ExtractedInvoice/ExtractedLineItem, RuleCheck (with
+               category?: "schema"|"business"), ValidationResult,
+               SchemaValidationResult, VendorMatchResult, PoMatchResult,
+               LineItemMatch.
+--- app/actions/invoices.ts ---
+Purpose        Invoice server actions: list, get detail (invoice + items +
+               report + matched PO + audit entries), createInvoice
+               (fileName/fileUrl/filePathname/fileType), runPipeline ->
+               processInvoice, deleteInvoice, getInvoiceStatus (polled by
+               the stepper).
+--- app/actions/purchase-orders.ts / vendors.ts ---
+Purpose        CRUD server actions for POs (+ items) and vendors, all
+               userId-scoped.
+--- app/actions/dashboard.ts ---
+Purpose        getDashboardData (KPIs + zero-hallucination metrics),
+               getAnalyticsData (decision breakdown, top exceptions from
+               validation_reports.checks, spend by vendor, straight-through
+               rate), getAuditLog (last 200 entries).
+--- app/api/blob/upload/route.ts ---
+Purpose        POST multipart upload. Auth required. Validates content type
+               (image/* | application/pdf) and <= 10 MB. put() with
+               access:"private" at invoices/{userId}/{ts}-{name}. Returns
+               { url, pathname, fileType }.
+--- app/api/blob/file/route.ts ---
+Purpose        GET ?pathname=... streams a private blob. Auth required and
+               the pathname MUST start with invoices/{userId}/ — otherwise
+               403. Prevents cross-user file access.
+--- components/invoices/invoices-view.tsx ---
+Purpose        Invoice list + upload dialog. handleFile: POST upload ->
+               createInvoice -> runPipeline, driving a simulated stepper
+               (interval-based) while the server pipeline runs; polls
+               getInvoiceStatus; toasts result; router.refresh().
+--- components/invoices/invoice-detail.tsx ---
+Purpose        Invoice viewer with tabs (OCR / extracted JSON / matching /
+               rule checks / PO comparison). Uses /api/blob/file for the
+               "Open original" link when filePathname exists.
+--- components/invoices/rule-checks.tsx ---
+Purpose        Renders RuleCheck lists grouped into "Strict schema
+               validation" and "Deterministic business rules" sections with
+               pass counts, severity badges, expected/actual values.
+--- app/(app)/layout.tsx ---
+Purpose        Auth guard (redirect to /sign-in) + sidebar app shell.
+--- app/layout.tsx ---
+Purpose        Root layout: Geist fonts, metadata, forced dark class on
+               <html>, <Toaster theme="dark" />, Vercel Analytics.
+--------------------------------------------------------------------------------
+8. DATABASE DESIGN
+--------------------------------------------------------------------------------
+Conventions
+  - Auth tables (user, session, account, verification) follow Better Auth
+    defaults (text ids, camelCase columns) and DO have FK constraints.
+  - App tables use serial int PKs, carry a plain `userId` text column for
+    per-user scoping, and intentionally have NO FK constraints (relations
+    are enforced in application code).
+user (Better Auth)
+  id text PK · name · email (unique) · emailVerified bool · image ·
+  createdAt · updatedAt
+session (Better Auth)
+  id text PK · expiresAt · token (unique) · ipAddress · userAgent ·
+  userId FK -> user.id (cascade delete) · timestamps
+account (Better Auth; stores hashed password for the credential provider)
+  id text PK · accountId · providerId · userId FK -> user.id (cascade) ·
+  password (hashed) · token/expiry columns · timestamps
+verification (Better Auth)
+  id text PK · identifier · value · expiresAt · timestamps
+vendors
+  id serial PK · userId · name · taxId · email · phone · address ·
+  paymentTerms · createdAt
+  Relationships: referenced logically by purchase_orders.vendorId and
+  invoices.matchedVendorId (no FK).
+purchase_orders
+  id serial PK · userId · poNumber · vendorId (logical -> vendors.id) ·
+  vendorName (denormalized) · status ("open"|"closed"|"cancelled") ·
+  currency · orderDate · subtotal/tax/totalAmount numeric(14,2) · createdAt
+purchase_order_items
+  id serial PK · userId · poId (logical -> purchase_orders.id) ·
+  description · sku · quantity/unitPrice/lineTotal numeric(14,2)
+invoices
+  id serial PK · userId
+  File:       fileName · fileUrl · filePathname (private-blob pathname;
+              nullable for legacy rows) · fileType
+  Status:     status ("uploaded"|"processing"|"validated"|"failed";
+              "extracted"/"matched" reserved but unused)
+  Extraction: ocrText · extracted jsonb · invoiceNumber · vendorName ·
+              invoiceDate · poNumberRaw · currency · subtotal · tax ·
+              totalAmount
+  Matching:   matchedVendorId (logical -> vendors.id) · matchedPoId
+              (logical -> purchase_orders.id) · matchConfidence numeric(5,4)
+  Decision:   decision ("approve"|"review"|"reject") · validationScore ·
+              errorMessage
+  createdAt · updatedAt
+invoice_items
+  id serial PK · userId · invoiceId (logical -> invoices.id) · description ·
+  sku · quantity/unitPrice/lineTotal · matchedPoItemId (logical ->
+  purchase_order_items.id) · matchScore numeric(5,4)
+validation_reports
+  id serial PK · userId · invoiceId (logical -> invoices.id) · decision ·
+  score numeric(5,4) · checks jsonb (full RuleCheck[] array, schema +
+  business) · createdAt
+audit_logs
+  id serial PK · userId · invoiceId (nullable, logical) · step ("upload"|
+  "ocr"|"extraction"|"schema"|"matching"|"rules"|"decision") · status
+  ("started"|"success"|"failed") · message · data jsonb · durationMs ·
+  createdAt
+--------------------------------------------------------------------------------
+9. API DOCUMENTATION
+--------------------------------------------------------------------------------
+REST route handlers
+  POST /api/blob/upload
+    Auth:     required (session cookie)
+    Body:     multipart/form-data with field "file"
+    Rules:    image/* or application/pdf; max 10 MB
+    Response: 200 { url, pathname, fileType } | 400 invalid | 401 | 413
+    Purpose:  Store the invoice document in the private Blob store under
+              invoices/{userId}/.
+  GET /api/blob/file?pathname={encoded pathname}
+    Auth:     required; pathname must begin with invoices/{userId}/
+    Response: 200 binary stream (correct content type) | 400 | 401 | 403 | 404
+    Purpose:  Securely stream a private invoice file to its owner (used by
+              the "Open original" link).
+  GET|POST /api/auth/[...all]
+    Purpose:  Better Auth catch-all (sign-up, sign-in, sign-out, session).
+              Handled entirely by the better-auth library.
+Server Actions (the primary "API"; all require a session and are
+userId-scoped; all mutations revalidate the relevant paths)
+  vendors.ts:            getVendors() · createVendor(input) ·
+                         deleteVendor(id)
+  purchase-orders.ts:    getPurchaseOrders() · getPurchaseOrder(id) ·
+                         createPurchaseOrder(header, items[]) ·
+                         deletePurchaseOrder(id)
+  invoices.ts:           getInvoices() · getInvoiceDetail(id) ·
+                         createInvoice({fileName,fileUrl,filePathname?,
+                         fileType?}) · runPipeline(invoiceId) ·
+                         getInvoiceStatus(invoiceId) · deleteInvoice(id)
+  dashboard.ts:          getDashboardData() · getAnalyticsData() ·
+                         getAuditLog()
+--------------------------------------------------------------------------------
+10. AI PIPELINE (STAGE BY STAGE)
+--------------------------------------------------------------------------------
+Stage 1 — Invoice upload
+  Client posts the file to /api/blob/upload; server stores it privately and
+  createInvoice writes the invoices row (status "uploaded"). runPipeline is
+  then invoked and sets status "processing". Audit: step "upload".
+Stage 2 — OCR
+  readInvoiceBytes streams the private blob server-side (get() with
+  access:"private"; legacy fallback: fetch(fileUrl)). extractInvoice's first
+  LLM pass transcribes all legible text -> ocrText. Audit: step "ocr".
+  NOTE: this is vision-LLM transcription, not a classical OCR engine.
+Stage 3 — LLM extraction
+  Second LLM pass with Output.object + zod schema returns the structured
+  ExtractedInvoice (header fields + line items). The system prompt requires
+  nulls for missing fields ("Never invent values"). Persisted onto the
+  invoices row (ocrText, extracted jsonb, denormalized header columns).
+  Audit: step "extraction".
+Stage 4 — Strict schema validation
+  validateInvoiceSchema runs deterministically on the raw extraction:
+  required fields, types, ranges, date/currency validity, line-item shape.
+  Emits category:"schema" RuleChecks. The pipeline continues either way, but
+  these checks are folded into the final rule report where a critical schema
+  failure forces rejection. Audit: step "schema".
+Stage 5 — Purchase order retrieval + fuzzy matching + re-ranking
+  All of the user's vendors and open POs (with totals) are loaded from
+  Postgres. matchVendor resolves the vendor (threshold 0.55).
+  matchPurchaseOrder tries exact normalized PO-number match first
+  (confidence 1.0), else a weighted fuzzy blend (threshold 0.6).
+  crossEncoderRerank (SIMULATED — see 2.A) re-scores the top PO candidates
+  using joint query/candidate similarity to sharpen the ranking.
+  Audit: step "matching" (payload includes candidates and scores).
+Stage 6 — Parent PO alignment (line items)
+  matchLineItems greedily assigns each invoice line to its best PO line
+  (SKU exact match wins; otherwise description similarity; accept >= 0.5).
+  Assignments and scores are persisted in invoice_items
+  (matchedPoItemId, matchScore).
+Stage 7 — Duplicate detection
+  A per-user lookup checks whether another invoice with the same
+  invoiceNumber already exists -> feeds the "not_duplicate" critical rule.
+Stage 8 — Deterministic rule engine
+  runRules evaluates all business rules (section 11) against the extracted
+  data and the matched PO, with schema checks prepended. finalize() turns
+  weighted checks into score + decision. Audit: step "rules".
+Stage 9 — Validation report + decision
+  The full RuleCheck[] array, score, and decision are written to
+  validation_reports; the invoices row gets decision, validationScore, and
+  status "validated". Audit: step "decision".
+Stage 10 — Audit logging (cross-cutting)
+  Every stage above writes started/success/failed rows into audit_logs with
+  message, JSON payload, and durationMs. On any thrown error the invoice is
+  marked status "failed" with errorMessage and a failed audit row is
+  written — the pipeline never hangs.
+--------------------------------------------------------------------------------
+11. BUSINESS RULES (DETERMINISTIC RULE ENGINE)
+--------------------------------------------------------------------------------
+Schema-gate checks (category "schema"; see section 7, validation/schema.ts)
+  schema_invoice_number  critical  non-empty string
+  schema_vendor_name     critical  non-empty string
+  schema_total_type      critical  finite number > 0
+  schema_subtotal_type   warning   null or finite >= 0
+  schema_tax_type        warning   null or finite >= 0
+  schema_invoice_date    warning   parseable date
+  schema_currency        warning   null or 3-letter code
+  schema_line_items      critical* items exist and all well-formed
+                                   (*warning when zero items extracted)
+Business checks (category "business"; lib/rules/index.ts)
+  has_invoice_number            critical  w1    invoice number extracted
+  not_duplicate                 critical  w1    no prior invoice with the
+                                                same number for this user
+  has_total                     critical  w1    totalAmount present and > 0
+  po_matched                    critical  w1.5  a PO was resolved
+  vendor_matched                warning   w1    vendor confidence >= 0.55
+  po_open                       warning   w1    matched PO status == "open"
+  currency_match                critical  w1    invoice currency == PO
+                                                currency (case-insensitive)
+  total_within_tolerance        critical  w2    |invoice total − PO total|
+                                                <= 2% of PO total (default)
+  arithmetic_integrity          warning   w1    subtotal + tax == total
+                                                (±0.02 rounding allowance)
+  line_prices_within_tolerance  warning   w1    no line's unit price exceeds
+                                                the matched PO line by > 5%
+  quantities_within_po          warning   w1    no line bills more quantity
+                                                than the PO ordered
+Scoring and decision (finalize)
+  score    = sum(weights of passed checks) / sum(all weights), 0..1
+  decision = "reject"  if ANY critical check failed
+             "review"  if any warning failed OR score < 0.95
+             "approve" otherwise
+  Tolerances are code defaults (amountTolerancePct 0.02,
+  priceTolerancePct 0.05) — not yet user-editable.
+--------------------------------------------------------------------------------
+12. EXTERNAL DEPENDENCIES
+--------------------------------------------------------------------------------
+Runtime npm packages (package.json)
+  next 16.2.x            Framework (App Router, Server Actions, Turbopack)
+  react / react-dom 19   UI runtime
+  ai ^7                  AI SDK — generateText + Output.object via Gateway
+  zod ^4                 Structured-output schema for extraction
+  better-auth ^1.6       Email/password auth, sessions, password hashing
+  drizzle-orm ^0.45      Type-safe SQL ORM
+  pg ^8                  Postgres driver (Pool) for Neon
+  @vercel/blob ^2.6      Private file storage (put/get)
+  @vercel/analytics      Web analytics component
+  @base-ui/react         Headless primitives under the ui/ components
+  lucide-react           Icon set
+  sonner                 Toast notifications
+  next-themes            Theme hook (consumed by the sonner wrapper)
+  class-variance-authority / clsx / tailwind-merge
+                         Variant + class-merging utilities (cn())
+  tw-animate-css         Animation utility classes
+  shadcn                 Component tooling/registry
+Dev dependencies
+  typescript 5.7 · tailwindcss ^4.2 + @tailwindcss/postcss · postcss ·
+  @types/node, @types/react, @types/react-dom, @types/pg
+External services
+  Neon               Serverless Postgres (DATABASE_URL)
+  Vercel Blob        Private file store (BLOB_READ_WRITE_TOKEN)
+  Vercel AI Gateway  LLM access for "openai/gpt-4o". NOTE: requires a valid
+                     credit card on the Vercel account to unlock usage;
+                     otherwise extraction fails gracefully with
+                     "customer_verification_required".
+  Vercel             Hosting/deployment + analytics
+No Python packages, no Docker images, and no third-party REST APIs beyond
+the services above.
+--------------------------------------------------------------------------------
+13. CONFIGURATION
+--------------------------------------------------------------------------------
+Environment variables
+  DATABASE_URL             Neon Postgres connection string (lib/db/index.ts)
+  BETTER_AUTH_SECRET       Secret for Better Auth session/token signing
+  BLOB_READ_WRITE_TOKEN    Vercel Blob store token (private store)
+  AI Gateway               No key needed on Vercel deployment (ambient); outside
+                           Vercel set AI_GATEWAY_API_KEY.
+  (Neon integration may also inject POSTGRES_URL etc.; the app reads
+  DATABASE_URL.)
+Configuration files
+  package.json         Scripts: dev / build / start / lint. pnpm override
+                       pins hono 4.12.25 (transitive, for better-auth).
+  tsconfig.json        Strict TS; "@/*" path alias to the repo root.
+  postcss.config.mjs   Tailwind v4 via @tailwindcss/postcss.
+  app/globals.css      Tailwind v4 theme: design tokens (background,
+                       foreground, primary, muted, destructive, etc.) via
+                       @theme — the app is dark-only (html has class
+                       "dark" and bg-background).
+  components.json      shadcn/ui configuration.
+Business-logic configuration (in code, not env)
+  lib/rules/index.ts   amountTolerancePct 0.02 · priceTolerancePct 0.05
+  lib/ai/extraction.ts MODEL = "openai/gpt-4o"
+  upload route         10 MB max · image/* or application/pdf only
+Docker
+  Not used. The project runs directly under Node/pnpm and deploys to Vercel.
+Prisma
+  Not used. Drizzle ORM is the data layer; the live schema was applied to
+  Neon via SQL matching lib/db/schema.ts (no migration files are committed —
+  see Future Improvements).
+--------------------------------------------------------------------------------
+14. FUTURE IMPROVEMENTS
+--------------------------------------------------------------------------------
+Implemented (recap)
+  Auth · vendors · POs with line items · private uploads · full 7-stage
+  pipeline with real LLM extraction · strict schema gate · fuzzy matching ·
+  re-rank surrogate · line alignment · duplicate detection · rule engine ·
+  validation reports · audit log · invoice viewer with PO comparison ·
+  dashboard with zero-hallucination metrics · analytics · settings ·
+  loading/404/error boundaries.
+Placeholder modules to replace
+  - lib/matching/reranker.ts: swap the deterministic surrogate for a real
+    hosted cross-encoder (the function signature is already model-shaped).
+  - "OCR" stage: optionally add a classical OCR engine (e.g. Tesseract or a
+    document-AI service) and feed its text to the extraction pass.
+Not yet built
+  - Editable rule tolerances/thresholds in Settings (persisted per user).
+  - Human review workflow: approve/reject buttons with reviewer notes on
+    "review" invoices; state transitions and review audit entries.
+  - PO editing (currently create/delete only) and PO receipt/goods-received
+    (3-way match).
+  - Email notifications, CSV/PDF export, pagination for large tables,
+    multi-user organizations/teams, and role-based access.
+  - Drizzle migration files (drizzle-kit) so schema changes are versioned.
+  - Automated tests (none exist; see section 15).
+  - Charting library for analytics if richer visuals are wanted.
+Recommended next steps (in order)
+  1. Add a credit card to the Vercel account so AI Gateway calls succeed;
+     run one real invoice end-to-end.
+  2. Introduce drizzle-kit migrations to version the schema.
+  3. Build the human review workflow (highest business value).
+  4. Make tolerances editable per user and feed them into runRules.
+  5. Add unit tests for lib/matching, lib/rules, lib/validation (pure
+     functions — trivial to test), then integration tests for the pipeline.
+--------------------------------------------------------------------------------
+15. DEVELOPMENT GUIDE
+--------------------------------------------------------------------------------
+Prerequisites
+  Node 20+, pnpm, access to the Neon database and the Vercel Blob store
+  (or your own instances + env vars).
+Install dependencies
+  pnpm install
+Environment
+  Create .env.development.local (or use Vercel-injected vars) with:
+    DATABASE_URL=postgres://...          (Neon)
+    BETTER_AUTH_SECRET=...               (openssl rand -base64 32)
+    BLOB_READ_WRITE_TOKEN=...            (Vercel Blob, private store)
+  On Vercel deployment the AI Gateway needs no key; locally set AI_GATEWAY_API_KEY.
+Database setup
+  The live Neon database already contains all tables. For a fresh database,
+  create the tables to match lib/db/schema.ts (auth tables must keep Better
+  Auth's exact camelCase column names).
+Run locally (frontend and backend are one Next.js app)
+  pnpm dev            # starts Next.js dev server (default port 3000)
+Build for production
+  pnpm build          # next build
+  pnpm start          # serve the production build
+Lint / typecheck
+  pnpm lint           # ESLint
+  pnpm exec tsc --noEmit   # strict type check
+Tests
+  There is currently no test suite. The pure modules (lib/matching,
+  lib/rules, lib/validation) are side-effect-free and are the recommended
+  starting point when adding one (e.g. with vitest).
+Manual end-to-end test
+  1. Sign up at /sign-up.
+  2. Create a vendor, then a PO with line items.
+  3. Upload public/samples/sample-invoice.png on /invoices.
+  4. Watch the stepper; open the invoice to inspect OCR, extraction,
+     matching, rule checks, and the PO comparison; check /audit-log.
+================================================================================
+END OF DOCUMENTATION
+================================================================================
